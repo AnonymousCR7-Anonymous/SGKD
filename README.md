@@ -20,3 +20,5 @@ Please refer to `MDSViTNet.py`. It implements MDSViTNet as a Vit-based model for
 
 ## SGKD for salient object detection
 Please refer to `KD_SOD.py`. This code implements proposed SGKD on TrafficGaze-SOD dataset. First, it loads pretrained S-ViT teacher model which has been trained on salient maps. Then, Yolo-Tiny as the student model detects the objects in the scene. After that, the attention/energy is calculated by 
+
+## Baseline salient object detection (with post-processing)
