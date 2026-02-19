@@ -16,11 +16,15 @@ Please refer to `ObjAnnotation.py`. This code first applies every 5-frame sampli
 ## S-ViT for salient map estimation
 Please refer to `S_ViT.py`. This code implements the proposed Saliency ViT (S-ViT) on TrafficGaze dataset.
 
+![Alt text](Pics/ViT.png)
+
 ## MDSViTNet
 Please refer to `MDSViTNet.py`. It implements MDSViTNet as a Vit-based model for saliency map estimation task.
 
 ## SGKD for salient object detection
 Please refer to `KD_SOD.py`. This code implements the proposed SGKD on TrafficGaze-SOD dataset. First, it loads pretrained S-ViT teacher model which has been trained on salient maps. Then, Yolo-Tiny as the student model detects the objects in the scene. After that, the attention/energy is calculated by 
+
+![Alt text](Pics/Framework.png)
 
 ## Baseline salient object detection (with post-processing)
 Please refer to `SalientObjBaseline.py`. This implements the Yolo-Tiny without KD method and uses a conventional computer vision method (spectral residual) as the bottom-up post-processing step for saliency region detection after object detection phase.
