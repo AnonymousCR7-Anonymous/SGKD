@@ -16,7 +16,8 @@ Please refer to `ObjAnnotation.py`. This code first applies every 5-frame sampli
 ## S-ViT for salient map estimation
 Please refer to `S_ViT.py`. This code implements the proposed Saliency ViT (S-ViT) on TrafficGaze dataset.
 
-![Alt text](Pics/ViT.png)
+<img src="Pics/ViT.png" alt="Alt text" width="600">
+
 
 ## MDSViTNet
 Please refer to `MDSViTNet.py`. It implements MDSViTNet as a Vit-based model for saliency map estimation task.
