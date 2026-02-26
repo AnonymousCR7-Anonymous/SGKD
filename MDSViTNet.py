@@ -1,22 +1,11 @@
 #!/usr/bin/env python3
 """
-TrafficGaze_MDSViTNet_FixationMetrics.py
 
 TrafficGaze saliency with MDS-ViTNet model using fixation-based metrics:
   - AUC-Borji: Area Under ROC Curve (Borji variant with uniform random sampling)
   - AUC-Judd: Area Under ROC Curve (Judd variant with saliency map as importance)
   - NSS: Normalized Scanpath Saliency
   - IG: Information Gain (relative to center bias baseline)
-
-This script supports:
-  1) Training with fixation-aware losses (NSS-based)
-  2) Evaluation using all four fixation metrics
-  3) Optional fixation map generation from saliency maps via thresholding
-
-Run examples:
-  python TrafficGaze_MDSViTNet_FixationMetrics.py --loss nss
-  python TrafficGaze_MDSViTNet_FixationMetrics.py --loss combo_fix
-  python TrafficGaze_MDSViTNet_FixationMetrics.py --loss combo_fix --use_merge
 """
 
 import os
