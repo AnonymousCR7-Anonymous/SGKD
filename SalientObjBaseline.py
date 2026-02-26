@@ -27,7 +27,7 @@ from yolox.utils import postprocess
 # ============================================================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-TRAFFICGAZE_ROOT = "/home/aixlab/datasets/TrafficGaze"
+TRAFFICGAZE_ROOT = ".../TrafficGaze"
 
 # YOLOX-Tiny configuration
 YOLOX_EXP_FILE = "exps/default/yolox_tiny.py"
