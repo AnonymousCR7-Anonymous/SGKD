@@ -2,30 +2,20 @@
 TrafficGaze – Saliency→Attended-Object Detection via KD (teacher-free inference) Rescoring
 ======================================================================================
 
-Goal (matches your text):
+Goal:
 - Training: use a frozen saliency teacher (ViT-B/16 DINO) ONLY to guide training of a small MLP rescoring head.
 - Inference / deployment: teacher is NOT used.
     => Inference = YOLOX-Tiny detector + MLP rescoring head (re-rank + top-K / threshold)
 
-What changed vs your old script:
-1) The KD rescoring head NO LONGER takes teacher saliency as an INPUT feature.
-   - Old: score = MLP(conf, sal_e, cx, cy, area, cls)
-   - New: score = MLP(conf, cx, cy, area, aspect, cls)      (teacher-free features)
-
-2) Teacher is used ONLY during KD head training as an extra distillation signal:
-   - Supervision A (hard): IoU with attended GT (A-lines)  -> y_tp ∈ {0,1}
-   - Supervision B (soft): teacher saliency energy in the proposal box -> y_sal ∈ [0,1]
-   - Loss = BCEWithLogits(y_tp) + LAMBDA_DISTILL * MSE(sigmoid(logits), y_sal)
-
-3) KD inference no longer computes teacher_saliency_map().
-
-Run:
-  python KD_Student_YoloXTiny_teacher_free_infer.py
+Modified in this version:
+1) Data splitting is now JSON-based (train.json / valid.json / test.json),
+   matching your saliency-map-estimation split files.
+2) The old fixed video-ID split (TRAIN_VIDS / VAL_VIDS / TEST_VIDS) is removed.
+3) Everything else in the KD / teacher-free inference logic is preserved.
 """
 
 import os
 import sys
-import glob
 import random
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional
@@ -51,16 +41,17 @@ from yolox.utils import postprocess
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 TRAFFICGAZE_ROOT = ".../TrafficGaze"
-TEACHER_CKPT = ".../KD/teacher_saliency_dino_224.pth"
+TEACHER_CKPT = ".../KD/teacher_saliency_dino_224.pth"  
 
 # YOLOX-Tiny configuration
 YOLOX_EXP_FILE = "exps/default/yolox_tiny.py"
 YOLOX_WEIGHTS = "yolox_tiny.pth"  # Pretrained weights (REQUIRED for detection to work!)
 
-# Splits
-TRAIN_VIDS = list(range(1, 11))   # 1-10
-VAL_VIDS   = [11, 12]
-TEST_VIDS  = [13, 14, 15, 16]
+# JSON split files (matches saliency map estimation)
+JSON_SPLIT_DIR = ".../Traffic_Gaze"
+TRAIN_JSON = os.path.join(JSON_SPLIT_DIR, "train.json")
+VALID_JSON = os.path.join(JSON_SPLIT_DIR, "valid.json")
+TEST_JSON  = os.path.join(JSON_SPLIT_DIR, "test.json")
 
 # -----------------------------
 # Class handling
@@ -354,32 +345,76 @@ class YOLOXStudent:
 
 
 # ============================================================
-# Data utilities
+# Data utilities (JSON-based splits)
 # ============================================================
 def video_dir(vid: int) -> str:
     return os.path.join(TRAFFICGAZE_ROOT, f"Video{vid}_salient_dataset")
 
 
-def list_frames_for_videos(video_ids: List[int]) -> List[Tuple[int, str, str]]:
+def parse_json_split(json_path: str) -> set:
+    """
+    Parse split file and return a set of (video_id, frame_name) tuples.
+
+    Expected line format (matching your splitting code):
+        3/000123.jpg
+        7/001045.png
+
+    Note:
+    - This parser treats the split files as line-based text entries.
+    - If your files are true JSON arrays/objects, let me know and I will switch
+      this to json.load(...) parsing.
+    """
+    entries = set()
+
+    if not os.path.exists(json_path):
+        print(f"[Split] WARNING: JSON split file not found: {json_path}")
+        return entries
+
+    with open(json_path, "r") as f:
+        for line in f:
+            line = line.strip().strip('"').strip("'")
+            if not line or line.startswith("#"):
+                continue
+
+            if "/" in line:
+                vid_str, frame_name = line.split("/", 1)
+                try:
+                    vid = int(vid_str)
+                    entries.add((vid, frame_name))
+                except ValueError:
+                    continue
+
+    return entries
+
+
+def list_frames_from_json(json_path: str) -> List[Tuple[int, str, str]]:
+    """
+    List frames from JSON split file, filtering to existing salient dataset frames.
+    Returns:
+        [(vid, img_path, lbl_path), ...]
+    """
+    entries = parse_json_split(json_path)
     out = []
-    for vid in video_ids:
+
+    for vid, frame_name in entries:
         vdir = video_dir(vid)
         img_dir = os.path.join(vdir, "images")
         lbl_dir = os.path.join(vdir, "labels")
+
         if not os.path.isdir(img_dir) or not os.path.isdir(lbl_dir):
             continue
 
-        txts = sorted(glob.glob(os.path.join(lbl_dir, "*.txt")))
-        for t in txts:
-            stem = os.path.splitext(os.path.basename(t))[0]
+        base_name = os.path.splitext(frame_name)[0]
+        img_jpg = os.path.join(img_dir, base_name + ".jpg")
+        img_png = os.path.join(img_dir, base_name + ".png")
+        lbl_path = os.path.join(lbl_dir, base_name + ".txt")
 
-            img_jpg = os.path.join(img_dir, stem + ".jpg")
-            img_png = os.path.join(img_dir, stem + ".png")
+        if os.path.isfile(img_jpg) and os.path.isfile(lbl_path):
+            out.append((vid, img_jpg, lbl_path))
+        elif os.path.isfile(img_png) and os.path.isfile(lbl_path):
+            out.append((vid, img_png, lbl_path))
 
-            if os.path.isfile(img_jpg):
-                out.append((vid, img_jpg, t))
-            elif os.path.isfile(img_png):
-                out.append((vid, img_png, t))
+    out.sort(key=lambda x: (x[0], os.path.basename(x[1])))
     return out
 
 
@@ -392,8 +427,10 @@ def cxcywhn_to_xyxy_px(cx, cy, w, h, W, H):
     y1 = float(np.clip(y1, 0, H - 1))
     x2 = float(np.clip(x2, 0, W - 1))
     y2 = float(np.clip(y2, 0, H - 1))
-    if x2 < x1: x1, x2 = x2, x1
-    if y2 < y1: y1, y2 = y2, y1
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
     return [x1, y1, x2, y2]
 
 
@@ -413,9 +450,11 @@ def parse_attended_gt(
             parts = line.split()
             if len(parts) != 6:
                 continue
+
             tag, cls_s, cx_s, cy_s, w_s, h_s = parts
             if tag != "A":
                 continue
+
             cls = int(cls_s)
 
             # For 5-class mode, skip bus (5) and truck (6)
@@ -424,8 +463,13 @@ def parse_attended_gt(
 
             if class_mode == "agnostic":
                 cls = 0
-            cx = float(cx_s); cy = float(cy_s); ww = float(w_s); hh = float(h_s)
+
+            cx = float(cx_s)
+            cy = float(cy_s)
+            ww = float(w_s)
+            hh = float(h_s)
             gts.append((cls, cxcywhn_to_xyxy_px(cx, cy, ww, hh, W, H)))
+
     return gts
 
 
@@ -587,7 +631,8 @@ def compute_map50(
                 gt_boxes = [gb for (gc, gb) in gts_by_image[img_i] if gc == c]
 
             if len(gt_boxes) == 0:
-                fp.append(1.0); tp.append(0.0)
+                fp.append(1.0)
+                tp.append(0.0)
                 continue
 
             best_iou = 0.0
@@ -600,9 +645,11 @@ def compute_map50(
 
             if best_iou >= IOU_POS and best_j >= 0 and (not used[img_i][best_j]):
                 used[img_i][best_j] = True
-                tp.append(1.0); fp.append(0.0)
+                tp.append(1.0)
+                fp.append(0.0)
             else:
-                fp.append(1.0); tp.append(0.0)
+                fp.append(1.0)
+                tp.append(0.0)
 
         tp = np.array(tp, dtype=np.float32)
         fp = np.array(fp, dtype=np.float32)
@@ -625,8 +672,10 @@ def compute_map50(
 def saliency_energy_in_box(sal: np.ndarray, xyxy: List[float], mode: str = "p95") -> float:
     H, W = sal.shape[:2]
     x1, y1, x2, y2 = [int(round(v)) for v in xyxy]
-    x1 = max(0, min(W - 1, x1)); x2 = max(0, min(W - 1, x2))
-    y1 = max(0, min(H - 1, y1)); y2 = max(0, min(H - 1, y2))
+    x1 = max(0, min(W - 1, x1))
+    x2 = max(0, min(W - 1, x2))
+    y1 = max(0, min(H - 1, y1))
+    y2 = max(0, min(H - 1, y2))
     if x2 <= x1 or y2 <= y1:
         return 0.0
 
@@ -706,8 +755,10 @@ def draw_boxes(img_bgr, boxes: List[Tuple[List[float], str]], color=(0, 0, 255))
     for xyxy, text in boxes:
         x1, y1, x2, y2 = [int(round(v)) for v in xyxy]
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(out, text, (x1, max(0, y1 - 5)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        cv2.putText(
+            out, text, (x1, max(0, y1 - 5)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA
+        )
     return out
 
 
@@ -751,8 +802,10 @@ def save_eval_overlay(out_path, img_bgr, preds: List[PredBox], gts: List[Tuple[i
         fn_boxes.append((gb, f"FN c={gc}"))
     canvas = draw_boxes(canvas, fn_boxes, color=(0, 255, 255))
 
-    cv2.putText(canvas, title, (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(
+        canvas, title, (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA
+    )
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     if not out_path.lower().endswith(".jpg"):
@@ -779,7 +832,7 @@ def build_preds_for_split(
     """
     score_mode:
       - "raw"     : YOLOX confidence
-      - "teacher" : (ABlation) teacher saliency energy per box (requires teacher at eval time)
+      - "teacher" : (ablation) teacher saliency energy per box (requires teacher at eval time)
       - "kd"      : teacher-free inference: YOLOX proposals + MLP(head) using ONLY student/box features
     """
     preds_all = []
@@ -791,6 +844,7 @@ def build_preds_for_split(
             preds_all.append([])
             gts_all.append([])
             continue
+
         H, W = img.shape[:2]
         gts = parse_attended_gt(lbl_path, W, H, class_mode=class_mode, num_classes=num_classes)
 
@@ -834,12 +888,12 @@ def build_preds_for_split(
                     raise RuntimeError("head must be provided for score_mode='kd'")
                 conf_f, cx, cy, area, aspect = box_features_from_xyxy(conf, xyxy, W, H)
                 with torch.no_grad():
-                    conf_t   = torch.tensor([conf_f], device=DEVICE, dtype=torch.float32)
-                    cx_t     = torch.tensor([cx], device=DEVICE, dtype=torch.float32)
-                    cy_t     = torch.tensor([cy], device=DEVICE, dtype=torch.float32)
-                    area_t   = torch.tensor([area], device=DEVICE, dtype=torch.float32)
-                    asp_t    = torch.tensor([aspect], device=DEVICE, dtype=torch.float32)
-                    cls_t    = torch.tensor([c], device=DEVICE, dtype=torch.long)
+                    conf_t = torch.tensor([conf_f], device=DEVICE, dtype=torch.float32)
+                    cx_t   = torch.tensor([cx], device=DEVICE, dtype=torch.float32)
+                    cy_t   = torch.tensor([cy], device=DEVICE, dtype=torch.float32)
+                    area_t = torch.tensor([area], device=DEVICE, dtype=torch.float32)
+                    asp_t  = torch.tensor([aspect], device=DEVICE, dtype=torch.float32)
+                    cls_t  = torch.tensor([c], device=DEVICE, dtype=torch.long)
                     score, _ = head(conf_t, cx_t, cy_t, area_t, asp_t, cls_t)
                     s = float(score.item())
             else:
@@ -936,6 +990,7 @@ def make_kd_samples(
         img = cv2.imread(img_path, cv2.IMREAD_COLOR)
         if img is None:
             continue
+
         H, W = img.shape[:2]
         gts = parse_attended_gt(lbl_path, W, H, class_mode=class_mode, num_classes=num_classes)
 
@@ -1004,6 +1059,7 @@ def train_kd_head(
     pos = float(ys.sum())
     neg = float(len(ys) - pos)
     pos_weight = torch.tensor([neg / (pos + 1e-9)], device=DEVICE, dtype=torch.float32)
+
     print(f"[KD] Samples: {len(train_samples)} | pos={pos:.0f} neg={neg:.0f} pos_weight={pos_weight.item():.3f}")
     print(f"[KD] Teacher distill: {USE_TEACHER_DISTILL} | lambda={LAMBDA_DISTILL}")
 
@@ -1017,15 +1073,15 @@ def train_kd_head(
         losses = []
 
         for b in batch_iter(train_samples, BATCH_SIZE):
-            conf   = torch.tensor([s.conf   for s in b], device=DEVICE, dtype=torch.float32)
-            cx     = torch.tensor([s.cx     for s in b], device=DEVICE, dtype=torch.float32)
-            cy     = torch.tensor([s.cy     for s in b], device=DEVICE, dtype=torch.float32)
-            area   = torch.tensor([s.area   for s in b], device=DEVICE, dtype=torch.float32)
+            conf   = torch.tensor([s.conf for s in b], device=DEVICE, dtype=torch.float32)
+            cx     = torch.tensor([s.cx for s in b], device=DEVICE, dtype=torch.float32)
+            cy     = torch.tensor([s.cy for s in b], device=DEVICE, dtype=torch.float32)
+            area   = torch.tensor([s.area for s in b], device=DEVICE, dtype=torch.float32)
             aspect = torch.tensor([s.aspect for s in b], device=DEVICE, dtype=torch.float32)
-            cls    = torch.tensor([s.cls    for s in b], device=DEVICE, dtype=torch.long)
+            cls    = torch.tensor([s.cls for s in b], device=DEVICE, dtype=torch.long)
 
-            y_tp   = torch.tensor([s.y_tp   for s in b], device=DEVICE, dtype=torch.float32)
-            y_sal  = torch.tensor([s.y_sal  for s in b], device=DEVICE, dtype=torch.float32)
+            y_tp   = torch.tensor([s.y_tp for s in b], device=DEVICE, dtype=torch.float32)
+            y_sal  = torch.tensor([s.y_sal for s in b], device=DEVICE, dtype=torch.float32)
 
             _, logits = head(conf, cx, cy, area, aspect, cls)
 
@@ -1051,7 +1107,7 @@ def train_kd_head(
 
         head.eval()
 
-        # IMPORTANT: validation uses TEACHER-FREE inference path
+        # Validation uses TEACHER-FREE inference path
         val_preds, val_gts = build_preds_for_split(
             student=student,
             frames=val_frames,
@@ -1132,9 +1188,14 @@ def main():
     # Teacher is loaded for training distillation (and optional teacher baseline)
     teacher = build_teacher(TEACHER_CKPT) if USE_TEACHER_DISTILL else None
 
-    train_frames = list_frames_for_videos(TRAIN_VIDS)
-    val_frames   = list_frames_for_videos(VAL_VIDS)
-    test_frames  = list_frames_for_videos(TEST_VIDS)
+    # JSON-based splits
+    train_frames = list_frames_from_json(TRAIN_JSON)
+    val_frames   = list_frames_from_json(VALID_JSON)
+    test_frames  = list_frames_from_json(TEST_JSON)
+
+    print(f"[Split files] train={TRAIN_JSON}")
+    print(f"[Split files] val  ={VALID_JSON}")
+    print(f"[Split files] test ={TEST_JSON}")
     print(f"[Split] Train frames: {len(train_frames)} | Val frames: {len(val_frames)} | Test frames: {len(test_frames)}")
 
     SAL_POOL = "p95"
@@ -1142,7 +1203,7 @@ def main():
     # ---------------------------
     # Baseline 1: raw detector
     # ---------------------------
-    print("\n===== EVAL 1: Student RAW (VAL 11–12) =====")
+    print("\n===== EVAL 1: Student RAW (VAL split) =====")
     val_preds_raw, val_gts = build_preds_for_split(
         student=student,
         frames=val_frames,
@@ -1162,7 +1223,7 @@ def main():
     # ---------------------------
     # Optional baseline: teacher-score (NOT deployment)
     # ---------------------------
-    print("\n===== EVAL 2 (ABlation): Student proposals scored by TEACHER saliency (VAL 11–12) =====")
+    print("\n===== EVAL 2 (ABlation): Student proposals scored by TEACHER saliency (VAL split) =====")
     val_preds_teacher, val_gts2 = build_preds_for_split(
         student=student,
         frames=val_frames,
@@ -1183,7 +1244,7 @@ def main():
     # ---------------------------
     # Train KD head (teacher used ONLY for distillation targets, not inference)
     # ---------------------------
-    print("\n===== TRAIN: KD rescoring head on TRAIN(1–10) =====")
+    print("\n===== TRAIN: KD rescoring head on TRAIN split =====")
     train_samples = make_kd_samples(
         student=student,
         frames=train_frames,
@@ -1235,7 +1296,7 @@ def main():
     # ---------------------------
     # Evaluate KD (teacher-free inference)
     # ---------------------------
-    print("\n===== EVAL 3: Student + TRAINED KD RESCORING HEAD (VAL 11–12) [teacher-free inference] =====")
+    print("\n===== EVAL 3: Student + TRAINED KD RESCORING HEAD (VAL split) [teacher-free inference] =====")
     val_preds_kd, val_gts3 = build_preds_for_split(
         student=student,
         frames=val_frames,
@@ -1243,7 +1304,7 @@ def main():
         class_mode=CLASS_MODE,
         coco_to_our=coco_to_our,
         head=head,
-        teacher=None,   # << teacher-free inference
+        teacher=None,   # teacher-free inference
         topk=KD_TOPK_INFER,
         score_th=KD_TH_INFER,
         num_classes=NUM_CLASSES_MODE,
@@ -1256,25 +1317,41 @@ def main():
     # Test split evaluation
     # ---------------------------
     if len(test_frames) > 0:
-        print("\n===== TEST: RAW vs TEACHER_SCORE (ablation) vs KD (teacher-free) (Videos 13–16) =====")
+        print("\n===== TEST: RAW vs TEACHER_SCORE (ablation) vs KD (teacher-free) (TEST split) =====")
 
         test_raw, test_gts = build_preds_for_split(
-            student=student, frames=test_frames,
-            score_mode="raw", class_mode=CLASS_MODE, coco_to_our=coco_to_our,
-            topk=TOPK, score_th=None, num_classes=NUM_CLASSES_MODE
+            student=student,
+            frames=test_frames,
+            score_mode="raw",
+            class_mode=CLASS_MODE,
+            coco_to_our=coco_to_our,
+            topk=TOPK,
+            score_th=None,
+            num_classes=NUM_CLASSES_MODE
         )
         test_teacher, _ = build_preds_for_split(
-            student=student, frames=test_frames,
-            score_mode="teacher", class_mode=CLASS_MODE, coco_to_our=coco_to_our,
+            student=student,
+            frames=test_frames,
+            score_mode="teacher",
+            class_mode=CLASS_MODE,
+            coco_to_our=coco_to_our,
             teacher=teacher if teacher is not None else build_teacher(TEACHER_CKPT),
             sal_pool=SAL_POOL,
-            topk=TOPK, score_th=None, num_classes=NUM_CLASSES_MODE
+            topk=TOPK,
+            score_th=None,
+            num_classes=NUM_CLASSES_MODE
         )
         test_kd, _ = build_preds_for_split(
-            student=student, frames=test_frames,
-            score_mode="kd", class_mode=CLASS_MODE, coco_to_our=coco_to_our,
-            head=head, teacher=None,  # teacher-free inference
-            topk=KD_TOPK_INFER, score_th=KD_TH_INFER, num_classes=NUM_CLASSES_MODE
+            student=student,
+            frames=test_frames,
+            score_mode="kd",
+            class_mode=CLASS_MODE,
+            coco_to_our=coco_to_our,
+            head=head,
+            teacher=None,  # teacher-free inference
+            topk=KD_TOPK_INFER,
+            score_th=KD_TH_INFER,
+            num_classes=NUM_CLASSES_MODE
         )
 
         test_raw_dir = os.path.join(VIS_DIR, "TEST_RAW")
@@ -1298,7 +1375,12 @@ def main():
         f.write(f"CONF_TH_RAW={CONF_TH_RAW} NMS_IOU={NMS_IOU} MAX_DET={MAX_DET} TOPK_DEFAULT={TOPK} IOU_POS={IOU_POS}\n")
         f.write(f"USE_TEACHER_DISTILL={USE_TEACHER_DISTILL} LAMBDA_DISTILL={LAMBDA_DISTILL}\n")
         f.write(f"KD_LOSS={KD_LOSS}\n")
-        f.write(f"TRAIN_VIDS={TRAIN_VIDS}\nVAL_VIDS={VAL_VIDS}\nTEST_VIDS={TEST_VIDS}\n")
+        f.write(f"TRAIN_JSON={TRAIN_JSON}\n")
+        f.write(f"VALID_JSON={VALID_JSON}\n")
+        f.write(f"TEST_JSON={TEST_JSON}\n")
+        f.write(f"Train_frames={len(train_frames)}\n")
+        f.write(f"Val_frames={len(val_frames)}\n")
+        f.write(f"Test_frames={len(test_frames)}\n")
         f.write(f"KD_SELECTION_AUTO_TUNE={AUTO_TUNE_KD_SELECTION}\n")
         f.write(f"KD_TOPK_INFER={KD_TOPK_INFER}\n")
         f.write(f"KD_TH_INFER={KD_TH_INFER}\n")
@@ -1308,10 +1390,10 @@ def main():
         f.write(f"Best head: {best_head_path}\n")
         f.write(f"VIS_DIR: {VIS_DIR}\n")
 
-    print("\n================ SUMMARY (VAL 11–12) ================")
-    print(f"CLASS_MODE       = {CLASS_MODE} | NUM_CLASSES_MODE={NUM_CLASSES_MODE}")
-    print(f"RAW             mAP@0.5 = {map_raw:.4f}")
-    print(f"TEACHER_SCORE   mAP@0.5 = {map_teacher:.4f}   (ablation; teacher evaluated)")
+    print("\n================ SUMMARY (VAL split) ================")
+    print(f"CLASS_MODE         = {CLASS_MODE} | NUM_CLASSES_MODE={NUM_CLASSES_MODE}")
+    print(f"RAW               mAP@0.5 = {map_raw:.4f}")
+    print(f"TEACHER_SCORE     mAP@0.5 = {map_teacher:.4f}   (ablation; teacher evaluated)")
     print(f"KD (teacher-free) mAP@0.5 = {map_kd:.4f}      (deployment path)")
     print(f"KD Selection: K={KD_TOPK_INFER} | th={KD_TH_INFER}")
     print(f"[Saved] Runs: {RUN_DIR}")
@@ -1321,4 +1403,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
