@@ -17,7 +17,7 @@ start = time.time()
 # =============================================================================
 TRAFFIC_GAZE_ROOT = r".../TrafficGaze/Traffic_Gaze"
 FRAMES_ROOT       = os.path.join(TRAFFIC_GAZE_ROOT, "trafficframe")     # contains 01, 02, ..., 16
-FIX_ROOT          = r"/home/aixlab/datasets/TrafficGaze/fixdata"         # contains fixdata1.mat, ..., fixdata16.mat
+FIX_ROOT          = r".../TrafficGaze/fixdata"         # contains fixdata1.mat, ..., fixdata16.mat
 OUT_SAL_ROOT      = os.path.join(TRAFFIC_GAZE_ROOT, "saliencyframe")     # target output root
 
 # Default frame geometry (used if we cannot read the first frame)
